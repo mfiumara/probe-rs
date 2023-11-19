@@ -1,28 +1,28 @@
 //! Support for J-Link Debug probes
 
-use jaylink::{Capability, Interface, JayLink, SpeedConfig, SwoMode};
-
 use std::convert::{TryFrom, TryInto};
 use std::iter;
 use std::time::{Duration, Instant};
 
-use crate::architecture::arm::{ArmError, RawDapAccess};
-use crate::architecture::riscv::communication_interface::RiscvError;
-use crate::probe::common::bits_to_byte;
+use jaylink::{Capability, Interface, JayLink, SpeedConfig, SwoMode};
+
 use crate::{
     architecture::{
         arm::{
-            communication_interface::DapProbe, communication_interface::UninitializedArmProbe,
-            swo::SwoConfig, ArmCommunicationInterface, SwoAccess,
+            ArmCommunicationInterface, communication_interface::DapProbe,
+            communication_interface::UninitializedArmProbe, swo::SwoConfig, SwoAccess,
         },
         riscv::communication_interface::RiscvCommunicationInterface,
     },
+    DebugProbeSelector,
     probe::{
         arm_jtag::{ProbeStatistics, RawProtocolIo, SwdSettings},
         DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeType, JTAGAccess, WireProtocol,
     },
-    DebugProbeSelector,
 };
+use crate::architecture::arm::{ArmError, RawDapAccess};
+use crate::architecture::riscv::communication_interface::RiscvError;
+use crate::probe::common::bits_to_byte;
 
 const SWO_BUFFER_SIZE: u16 = 128;
 
@@ -400,24 +400,6 @@ impl DebugProbe for JLink {
         }))
     }
 
-    fn select_protocol(&mut self, protocol: WireProtocol) -> Result<(), DebugProbeError> {
-        // try to select the interface
-
-        let actual_protocol = self.select_interface(Some(protocol))?;
-
-        if actual_protocol == protocol {
-            self.protocol = Some(protocol);
-            Ok(())
-        } else {
-            self.protocol = Some(actual_protocol);
-            Err(DebugProbeError::UnsupportedProtocol(protocol))
-        }
-    }
-
-    fn active_protocol(&self) -> Option<WireProtocol> {
-        self.protocol
-    }
-
     fn get_name(&self) -> &'static str {
         "J-Link"
     }
@@ -563,6 +545,37 @@ impl DebugProbe for JLink {
         Ok(())
     }
 
+    fn select_protocol(&mut self, protocol: WireProtocol) -> Result<(), DebugProbeError> {
+        // try to select the interface
+
+        let actual_protocol = self.select_interface(Some(protocol))?;
+
+        if actual_protocol == protocol {
+            self.protocol = Some(protocol);
+            Ok(())
+        } else {
+            self.protocol = Some(actual_protocol);
+            Err(DebugProbeError::UnsupportedProtocol(protocol))
+        }
+    }
+
+    fn active_protocol(&self) -> Option<WireProtocol> {
+        self.protocol
+    }
+
+    fn has_arm_interface(&self) -> bool {
+        true
+    }
+
+    fn try_get_arm_interface<'probe>(
+        self: Box<Self>,
+    ) -> Result<Box<dyn UninitializedArmProbe + 'probe>, (Box<dyn DebugProbe>, DebugProbeError)>
+    {
+        let uninitialized_interface = ArmCommunicationInterface::new(self, true);
+
+        Ok(Box::new(uninitialized_interface))
+    }
+
     fn try_get_riscv_interface(
         self: Box<Self>,
     ) -> Result<RiscvCommunicationInterface, (Box<dyn DebugProbe>, RiscvError)> {
@@ -579,6 +592,10 @@ impl DebugProbe for JLink {
         }
     }
 
+    fn has_riscv_interface(&self) -> bool {
+        self.supported_protocols.contains(&WireProtocol::Jtag)
+    }
+
     fn get_swo_interface(&self) -> Option<&dyn SwoAccess> {
         Some(self as _)
     }
@@ -587,29 +604,12 @@ impl DebugProbe for JLink {
         Some(self as _)
     }
 
-    fn has_arm_interface(&self) -> bool {
-        true
-    }
-
-    fn has_riscv_interface(&self) -> bool {
-        self.supported_protocols.contains(&WireProtocol::Jtag)
-    }
-
     fn into_probe(self: Box<Self>) -> Box<dyn DebugProbe> {
         self
     }
 
     fn try_as_dap_probe(&mut self) -> Option<&mut dyn DapProbe> {
         Some(self)
-    }
-
-    fn try_get_arm_interface<'probe>(
-        self: Box<Self>,
-    ) -> Result<Box<dyn UninitializedArmProbe + 'probe>, (Box<dyn DebugProbe>, DebugProbeError)>
-    {
-        let uninitialized_interface = ArmCommunicationInterface::new(self, true);
-
-        Ok(Box::new(uninitialized_interface))
     }
 
     fn get_target_voltage(&mut self) -> Result<Option<f32>, DebugProbeError> {
@@ -679,8 +679,8 @@ impl JTAGAccess for JLink {
 
 impl RawProtocolIo for JLink {
     fn jtag_shift_tms<M>(&mut self, tms: M, tdi: bool) -> Result<(), DebugProbeError>
-    where
-        M: IntoIterator<Item = bool>,
+        where
+            M: IntoIterator<Item=bool>,
     {
         if self.protocol.unwrap() == crate::WireProtocol::Swd {
             panic!("Logic error, requested jtag_io when in SWD mode");
@@ -696,8 +696,8 @@ impl RawProtocolIo for JLink {
     }
 
     fn jtag_shift_tdi<I>(&mut self, tms: bool, tdi: I) -> Result<(), DebugProbeError>
-    where
-        I: IntoIterator<Item = bool>,
+        where
+            I: IntoIterator<Item=bool>,
     {
         if self.protocol.unwrap() == crate::WireProtocol::Swd {
             panic!("Logic error, requested jtag_io when in SWD mode");
@@ -713,9 +713,9 @@ impl RawProtocolIo for JLink {
     }
 
     fn swd_io<D, S>(&mut self, dir: D, swdio: S) -> Result<Vec<bool>, DebugProbeError>
-    where
-        D: IntoIterator<Item = bool>,
-        S: IntoIterator<Item = bool>,
+        where
+            D: IntoIterator<Item=bool>,
+            S: IntoIterator<Item=bool>,
     {
         if self.protocol.unwrap() == crate::WireProtocol::Jtag {
             panic!("Logic error, requested swd_io when in JTAG mode");

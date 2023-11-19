@@ -2,12 +2,14 @@ use std::time::Duration;
 
 use rusb::{Context, Device, UsbContext};
 
-use blackmagic_sys::Probe;
+use blackmagic_sys::{BlackMagicProbeError, Probe};
 
 use crate::{
     DebugProbeError, DebugProbeInfo, DebugProbeSelector, DebugProbeType, ProbeCreationError,
     WireProtocol,
 };
+use crate::architecture::arm::ArmCommunicationInterface;
+use crate::architecture::arm::communication_interface::UninitializedArmProbe;
 
 use super::DebugProbe;
 
@@ -91,7 +93,17 @@ impl DebugProbe for Bmp {
     /// Attach to the chip.
     ///
     /// This should run all the necessary protocol init routines.
-    // fn attach(&mut self) -> Result<(), DebugProbeError>;
+    fn attach(&mut self) -> Result<(), DebugProbeError> {
+        let ret: Result<(), BlackMagicProbeError>;
+        match self.protocol {
+            WireProtocol::Jtag => ret = self.handle.swd_init(),
+            WireProtocol::Swd => ret = self.handle.swd_init(),
+        }
+        match ret {
+            Ok(()) => Ok(()),
+            Err(err) => Err(err.into()),
+        }
+    }
 
     /// Detach from the chip.
     ///
@@ -100,10 +112,14 @@ impl DebugProbe for Bmp {
     /// If the probe uses batched commands, this will also cause all
     /// remaining commands to be executed. If an error occurs during
     /// this execution, the probe might remain in the attached state.
-    // fn detach(&mut self) -> Result<(), crate::Error>;
+    fn detach(&mut self) -> Result<(), crate::Error> {
+        Ok(())
+    }
 
     /// This should hard reset the target device.
-    // fn target_reset(&mut self) -> Result<(), DebugProbeError>;
+    fn target_reset(&mut self) -> Result<(), DebugProbeError> {
+        Err(super::DebugProbeError::NotImplemented("target_reset"))
+    }
 
     /// This should assert the reset pin of the target via debug probe.
     fn target_reset_assert(&mut self) -> Result<(), DebugProbeError> {
@@ -119,12 +135,8 @@ impl DebugProbe for Bmp {
 
     /// Selects the transport protocol to be used by the debug probe.
     fn select_protocol(&mut self, protocol: WireProtocol) -> Result<(), DebugProbeError> {
-        return match protocol {
-            WireProtocol::Swd | WireProtocol::Jtag => {
-                self.protocol = protocol;
-                Ok(())
-            }
-        };
+        self.protocol = protocol;
+        Ok(())
     }
 
     /// Get the transport protocol currently in active use by the debug probe.
@@ -133,21 +145,20 @@ impl DebugProbe for Bmp {
     }
 
     /// Check if the proble offers an interface to debug ARM chips.
-    // fn has_arm_interface(&self) -> bool {
-    //     false
-    // }
+    fn has_arm_interface(&self) -> bool {
+        true
+    }
 
     /// Get the dedicated interface to debug ARM chips. To check that the
     /// probe actually supports this, call [DebugProbe::has_arm_interface] first.
-    // fn try_get_arm_interface<'probe>(
-    //     self: Box<Self>,
-    // ) -> Result<Box<dyn UninitializedArmProbe + 'probe>, (Box<dyn DebugProbe>, DebugProbeError)>
-    // {
-    //     Err((
-    //         self.into_probe(),
-    //         DebugProbeError::InterfaceNotAvailable("ARM"),
-    //     ))
-    // }
+    fn try_get_arm_interface<'probe>(
+        self: Box<Self>,
+    ) -> Result<Box<dyn UninitializedArmProbe + 'probe>, (Box<dyn DebugProbe>, DebugProbeError)>
+    {
+        let uninitialized_interface = ArmCommunicationInterface::new(self, true);
+
+        Ok(Box::new(uninitialized_interface))
+    }
 
     /// Get the dedicated interface to debug RISCV chips. Ensure that the
     /// probe actually supports this by calling [DebugProbe::has_riscv_interface] first.
@@ -161,9 +172,9 @@ impl DebugProbe for Bmp {
     // }
 
     /// Check if the probe offers an interface to debug RISCV chips.
-    // fn has_riscv_interface(&self) -> bool {
-    //     false
-    // }
+    fn has_riscv_interface(&self) -> bool {
+        true
+    }
 
     /// Get a SWO interface from the debug probe.
     ///
@@ -230,7 +241,7 @@ pub(super) fn is_bmp_device<T: UsbContext>(device: &Device<T>) -> bool {
 
 #[tracing::instrument(skip_all)]
 pub(crate) fn list_bmp_devices() -> Vec<DebugProbeInfo> {
-    rusb::Context::new()
+    Context::new()
         .and_then(|context| context.devices())
         .map_or(vec![], |devices| {
             devices
@@ -269,8 +280,8 @@ pub(crate) fn list_bmp_devices() -> Vec<DebugProbeInfo> {
         })
 }
 
-impl From<blackmagic_sys::BlackMagicProbeError> for DebugProbeError {
-    fn from(e: blackmagic_sys::BlackMagicProbeError) -> DebugProbeError {
+impl From<BlackMagicProbeError> for DebugProbeError {
+    fn from(e: BlackMagicProbeError) -> DebugProbeError {
         DebugProbeError::ProbeSpecific(Box::new(e))
     }
 }
