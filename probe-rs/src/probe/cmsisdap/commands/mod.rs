@@ -16,7 +16,7 @@ use self::general::host_status::HostStatusRequest;
 use self::swj::clock::SWJClockRequest;
 use self::transfer::InnerTransferBlockRequest;
 
-const USB_TIMEOUT: Duration = Duration::from_millis(1000);
+pub(super) const USB_TIMEOUT: Duration = Duration::from_millis(1000);
 
 #[derive(Debug, thiserror::Error, docsplay::Display)]
 pub enum CmsisDapError {
@@ -189,6 +189,14 @@ pub enum CmsisDapDevice {
         max_packet_size: usize,
         swo_ep: Option<(u8, usize)>,
     },
+
+    /// CMSIS-DAP v3 over TCP.
+    /// Stores a TCP stream handle and maximum packet size.
+    /// Uses blocking I/O with fixed-size packet framing.
+    V3 {
+        stream: std::sync::Mutex<std::net::TcpStream>,
+        max_packet_size: usize,
+    },
 }
 
 impl CmsisDapDevice {
@@ -206,6 +214,21 @@ impl CmsisDapDevice {
             CmsisDapDevice::V2 { handle, in_ep, .. } => {
                 Ok(handle.read_bulk(*in_ep, buf, USB_TIMEOUT)?)
             }
+            CmsisDapDevice::V3 { stream, .. } => {
+                use std::io::Read;
+                let mut stream = stream.lock().unwrap();
+                match stream.read(buf) {
+                    Ok(0) => Err(SendError::Timeout),
+                    Ok(n) => Ok(n),
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        Err(SendError::Timeout)
+                    }
+                    Err(e) => Err(SendError::from(e)),
+                }
+            }
         }
     }
 
@@ -217,6 +240,16 @@ impl CmsisDapDevice {
             CmsisDapDevice::V2 { handle, out_ep, .. } => {
                 // Skip first byte as it's set to 0 for HID transfers
                 Ok(handle.write_bulk(*out_ep, &buf[1..], USB_TIMEOUT)?)
+            }
+            CmsisDapDevice::V3 { stream, .. } => {
+                use std::io::Write;
+                let mut stream = stream.lock().unwrap();
+                // TODO: Handle this properly and don't unwrap!!!
+                stream.write_all(&buf[1..]).unwrap();
+                // Force flush to ensure data is sent immediately over TCP
+                // Without this, Nagle's algorithm may delay small packets
+                stream.flush().unwrap();
+                Ok(buf.len())
             }
         }
     }
@@ -256,13 +289,34 @@ impl CmsisDapDevice {
                     }
                 }
             }
+
+            CmsisDapDevice::V3 {
+                stream,
+                max_packet_size,
+                ..
+            } => {
+                use std::io::Read;
+                let mut stream = stream.lock().unwrap();
+                // Set a very short timeout for draining
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(10)));
+                let mut discard = vec![0u8; *max_packet_size];
+                loop {
+                    match stream.read(&mut discard) {
+                        Ok(n) if n != 0 => continue,
+                        _ => break,
+                    }
+                }
+                // Restore TCP timeout (3 seconds for network latency)
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(3000)));
+            }
         }
     }
 
     /// Set the packet size to use for this device.
     ///
     /// Sets either the HID report size for V1 devices,
-    /// or the maximum bulk transfer size for V2 devices.
+    /// or the maximum bulk transfer size for V2 devices,
+    /// or the maximum packet size for V3 TCP devices.
     pub(super) fn set_packet_size(&mut self, packet_size: usize) {
         tracing::debug!("Configuring probe to use packet size {}", packet_size);
         match self {
@@ -271,6 +325,11 @@ impl CmsisDapDevice {
                 *report_size = packet_size;
             }
             CmsisDapDevice::V2 {
+                max_packet_size, ..
+            } => {
+                *max_packet_size = packet_size;
+            }
+            CmsisDapDevice::V3 {
                 max_packet_size, ..
             } => {
                 *max_packet_size = packet_size;
@@ -293,6 +352,10 @@ impl CmsisDapDevice {
                 Ok(size) => {
                     tracing::debug!("Success: packet size is {}", size);
                     self.set_packet_size(size as usize);
+                    // Give TCP connection a moment to settle after finding packet size
+                    if matches!(self, CmsisDapDevice::V3 { .. }) {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                     return Ok(size as usize);
                 }
 
@@ -300,7 +363,13 @@ impl CmsisDapDevice {
                 Err(CmsisDapError::Send {
                     source: SendError::Timeout,
                     ..
-                }) => (),
+                }) => {
+                    // For TCP connections, add a small delay between retries
+                    // to avoid flooding the network with requests
+                    if matches!(self, CmsisDapDevice::V3 { .. }) {
+                        std::thread::sleep(Duration::from_millis(1000));
+                    }
+                }
 
                 // Raise other errors.
                 Err(e) => return Err(e),
@@ -317,6 +386,7 @@ impl CmsisDapDevice {
             #[cfg(feature = "cmsisdap_v1")]
             CmsisDapDevice::V1 { .. } => false,
             CmsisDapDevice::V2 { swo_ep, .. } => swo_ep.is_some(),
+            CmsisDapDevice::V3 { .. } => false,
         }
     }
 
@@ -346,6 +416,7 @@ impl CmsisDapDevice {
                 }
                 None => Err(CmsisDapError::SwoModeNotAvailable),
             },
+            CmsisDapDevice::V3 { .. } => Err(CmsisDapError::SwoModeNotAvailable),
         }
     }
 }
@@ -443,6 +514,9 @@ fn send_command_inner<Req: Request>(
         #[cfg(feature = "cmsisdap_v1")]
         CmsisDapDevice::V1 { report_size, .. } => *report_size + 1,
         CmsisDapDevice::V2 {
+            max_packet_size, ..
+        } => *max_packet_size + 1,
+        CmsisDapDevice::V3 {
             max_packet_size, ..
         } => *max_packet_size + 1,
     };
