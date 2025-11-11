@@ -403,3 +403,55 @@ fn is_known_cmsis_dap_dev(device: &DeviceInfo) -> bool {
         .iter()
         .any(|&(vid, pid)| device.vendor_id() == vid && device.product_id() == pid)
 }
+
+/// Create a CMSIS-DAP v3 device from a TCP stream.
+///
+/// This function wraps a `std::net::TcpStream` into a `CmsisDapDevice::V3` variant,
+/// suitable for communicating with CMSIS-DAP probes over TCP instead of USB.
+///
+/// The TCP stream should already be connected and will be configured with appropriate
+/// timeouts for CMSIS-DAP communication.
+///
+/// # Arguments
+///
+/// * `stream` - An already-connected TCP stream to the CMSIS-DAP probe
+/// * `initial_packet_size` - Initial packet size (typically 64 or 512 bytes). Will be
+///   auto-detected during probe initialization via `find_packet_size()`.
+///
+/// # Returns
+///
+/// Returns a `CmsisDapDevice::V3` ready for use with CMSIS-DAP commands.
+pub fn new_tcp_device(
+    stream: std::net::TcpStream,
+    initial_packet_size: usize,
+) -> Result<CmsisDapDevice, ProbeCreationError> {
+    use std::time::Duration;
+
+    // TCP over network needs more time than USB, use 10 seconds
+    const TCP_TIMEOUT: Duration = Duration::from_secs(10);
+
+    // Configure timeouts for blocking I/O
+    stream
+        .set_read_timeout(Some(TCP_TIMEOUT))
+        .map_err(|_| ProbeCreationError::Other("Failed to set read timeout for TCP stream"))?;
+
+    stream
+        .set_write_timeout(Some(TCP_TIMEOUT))
+        .map_err(|_| ProbeCreationError::Other("Failed to set write timeout for TCP stream"))?;
+
+    // Disable Nagle's algorithm to send small packets immediately
+    // CMSIS-DAP commands are typically small and latency-sensitive
+    stream
+        .set_nodelay(true)
+        .map_err(|_| ProbeCreationError::Other("Failed to set TCP_NODELAY on stream"))?;
+
+    // Ensure the stream is in blocking mode (should be default, but make it explicit)
+    stream
+        .set_nonblocking(false)
+        .map_err(|_| ProbeCreationError::Other("Failed to set blocking mode on stream"))?;
+
+    Ok(CmsisDapDevice::V3 {
+        stream: std::sync::Mutex::new(stream),
+        max_packet_size: initial_packet_size,
+    })
+}
