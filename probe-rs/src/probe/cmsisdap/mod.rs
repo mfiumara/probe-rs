@@ -140,7 +140,10 @@ impl CmsisDap {
     pub fn new_from_device(mut device: CmsisDapDevice) -> Result<Self, DebugProbeError> {
         // Discard anything left in buffer, as otherwise
         // we'll get out of sync between requests and responses.
-        device.drain();
+        // For TCP (V3), the connection is fresh so no need to drain.
+        if !matches!(device, CmsisDapDevice::V3 { .. }) {
+            device.drain();
+        }
 
         // Determine and set the packet size. We do this as soon as possible after
         // opening the probe to ensure all future communication uses the correct size.

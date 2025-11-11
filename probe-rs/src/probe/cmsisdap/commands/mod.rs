@@ -16,7 +16,7 @@ use self::general::host_status::HostStatusRequest;
 use self::swj::clock::SWJClockRequest;
 use self::transfer::InnerTransferBlockRequest;
 
-pub(super) const USB_TIMEOUT: Duration = Duration::from_millis(1000);
+const USB_TIMEOUT: Duration = Duration::from_millis(1000);
 
 #[derive(Debug, thiserror::Error, docsplay::Display)]
 pub enum CmsisDapError {
@@ -217,16 +217,32 @@ impl CmsisDapDevice {
             CmsisDapDevice::V3 { stream, .. } => {
                 use std::io::Read;
                 let mut stream = stream.lock().unwrap();
+                // Log the current timeout setting
+                if let Ok(Some(timeout)) = (*stream).read_timeout() {
+                    tracing::trace!("TCP read timeout is set to: {:?}", timeout);
+                } else {
+                    tracing::warn!("Could not read TCP timeout setting");
+                }
                 match stream.read(buf) {
-                    Ok(0) => Err(SendError::Timeout),
-                    Ok(n) => Ok(n),
+                    Ok(0) => {
+                        tracing::debug!("TCP read returned 0 bytes (connection closed)");
+                        Err(SendError::Timeout)
+                    }
+                    Ok(n) => {
+                        tracing::trace!("TCP read returned {} bytes", n);
+                        Ok(n)
+                    }
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             || e.kind() == std::io::ErrorKind::TimedOut =>
                     {
+                        tracing::debug!("TCP read timed out: {:?}", e);
                         Err(SendError::Timeout)
                     }
-                    Err(e) => Err(SendError::from(e)),
+                    Err(e) => {
+                        tracing::debug!("TCP read error: {:?}", e);
+                        Err(SendError::from(e))
+                    }
                 }
             }
         }
@@ -306,8 +322,8 @@ impl CmsisDapDevice {
                         _ => break,
                     }
                 }
-                // Restore TCP timeout (3 seconds for network latency)
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(3000)));
+                // Restore TCP timeout (10 seconds for network latency)
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
             }
         }
     }
@@ -352,8 +368,11 @@ impl CmsisDapDevice {
                 Ok(size) => {
                     tracing::debug!("Success: packet size is {}", size);
                     self.set_packet_size(size as usize);
-                    // Give TCP connection a moment to settle after finding packet size
+                    // For TCP, give the probe time to finish processing
+                    // Since the probe only processes one command at a time and discards
+                    // buffered commands, we just need to wait for it to be ready
                     if matches!(self, CmsisDapDevice::V3 { .. }) {
+                        tracing::debug!("Waiting for probe to be ready for next command");
                         std::thread::sleep(Duration::from_millis(100));
                     }
                     return Ok(size as usize);
@@ -364,10 +383,11 @@ impl CmsisDapDevice {
                     source: SendError::Timeout,
                     ..
                 }) => {
-                    // For TCP connections, add a small delay between retries
-                    // to avoid flooding the network with requests
+                    // For TCP connections, add a longer delay between retries
+                    // to give the probe time to respond before retrying
                     if matches!(self, CmsisDapDevice::V3 { .. }) {
-                        std::thread::sleep(Duration::from_millis(1000));
+                        tracing::debug!("Packet size query timed out, waiting before retry");
+                        std::thread::sleep(Duration::from_secs(2));
                     }
                 }
 

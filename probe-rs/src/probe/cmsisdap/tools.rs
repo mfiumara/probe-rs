@@ -427,8 +427,8 @@ pub fn new_tcp_device(
 ) -> Result<CmsisDapDevice, ProbeCreationError> {
     use std::time::Duration;
 
-    // TCP over network needs more time than USB, use 3 seconds
-    const TCP_TIMEOUT: Duration = Duration::from_millis(3000);
+    // TCP over network needs more time than USB, use 10 seconds
+    const TCP_TIMEOUT: Duration = Duration::from_secs(10);
 
     // Configure timeouts for blocking I/O
     stream
@@ -444,6 +444,11 @@ pub fn new_tcp_device(
     stream
         .set_nodelay(true)
         .map_err(|_| ProbeCreationError::Other("Failed to set TCP_NODELAY on stream"))?;
+
+    // Ensure the stream is in blocking mode (should be default, but make it explicit)
+    stream
+        .set_nonblocking(false)
+        .map_err(|_| ProbeCreationError::Other("Failed to set blocking mode on stream"))?;
 
     Ok(CmsisDapDevice::V3 {
         stream: std::sync::Mutex::new(stream),
