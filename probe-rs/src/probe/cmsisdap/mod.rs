@@ -2,6 +2,9 @@
 mod commands;
 mod tools;
 
+// Re-export TCP device creation for external use
+pub use tools::new_tcp_device;
+
 use crate::{
     CoreStatus,
     architecture::{
@@ -130,10 +133,17 @@ impl std::fmt::Debug for CmsisDap {
 }
 
 impl CmsisDap {
-    fn new_from_device(mut device: CmsisDapDevice) -> Result<Self, DebugProbeError> {
+    /// Create a new CMSIS-DAP probe from a device handle.
+    ///
+    /// This function initializes the probe, detects packet size, and queries capabilities.
+    /// It can be used with any CmsisDapDevice variant (V1 HID, V2 USB, or V3 TCP).
+    pub fn new_from_device(mut device: CmsisDapDevice) -> Result<Self, DebugProbeError> {
         // Discard anything left in buffer, as otherwise
         // we'll get out of sync between requests and responses.
-        device.drain();
+        // For TCP (V3), the connection is fresh so no need to drain.
+        if !matches!(device, CmsisDapDevice::V3 { .. }) {
+            device.drain();
+        }
 
         // Determine and set the packet size. We do this as soon as possible after
         // opening the probe to ensure all future communication uses the correct size.

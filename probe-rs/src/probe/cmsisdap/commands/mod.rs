@@ -68,6 +68,9 @@ pub enum SendError {
     /// Error in the USB access.
     UsbError(std::io::Error),
 
+    /// Error in the TCP access.
+    TcpError(std::io::Error),
+
     /// Not enough data in response from probe.
     NotEnoughData,
 
@@ -189,6 +192,14 @@ pub enum CmsisDapDevice {
         max_packet_size: usize,
         swo_ep: Option<(u8, usize)>,
     },
+
+    /// CMSIS-DAP v3 over TCP.
+    /// Stores a TCP stream handle and maximum packet size.
+    /// Uses blocking I/O with fixed-size packet framing.
+    V3 {
+        stream: std::sync::Mutex<std::net::TcpStream>,
+        max_packet_size: usize,
+    },
 }
 
 impl CmsisDapDevice {
@@ -206,6 +217,37 @@ impl CmsisDapDevice {
             CmsisDapDevice::V2 { handle, in_ep, .. } => {
                 Ok(handle.read_bulk(*in_ep, buf, USB_TIMEOUT)?)
             }
+            CmsisDapDevice::V3 { stream, .. } => {
+                use std::io::Read;
+                let mut stream = stream.lock().unwrap();
+                // Log the current timeout setting
+                if let Ok(Some(timeout)) = (*stream).read_timeout() {
+                    tracing::trace!("TCP read timeout is set to: {:?}", timeout);
+                } else {
+                    tracing::warn!("Could not read TCP timeout setting");
+                }
+                match stream.read(buf) {
+                    Ok(0) => {
+                        tracing::debug!("TCP read returned 0 bytes (connection closed)");
+                        Err(SendError::Timeout)
+                    }
+                    Ok(n) => {
+                        tracing::trace!("TCP read returned {} bytes", n);
+                        Ok(n)
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        tracing::debug!("TCP read timed out: {:?}", e);
+                        Err(SendError::Timeout)
+                    }
+                    Err(e) => {
+                        tracing::debug!("TCP read error: {:?}", e);
+                        Err(SendError::from(e))
+                    }
+                }
+            }
         }
     }
 
@@ -217,6 +259,20 @@ impl CmsisDapDevice {
             CmsisDapDevice::V2 { handle, out_ep, .. } => {
                 // Skip first byte as it's set to 0 for HID transfers
                 Ok(handle.write_bulk(*out_ep, &buf[1..], USB_TIMEOUT)?)
+            }
+            CmsisDapDevice::V3 { stream, .. } => {
+                use std::io::Write;
+                let mut stream = stream.lock().map_err(|e| {
+                    SendError::TcpError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to acquire stream lock: {}", e),
+                    ))
+                })?;
+                stream.write_all(&buf[1..]).map_err(SendError::TcpError)?;
+                // Force flush to ensure data is sent immediately over TCP
+                // Without this, Nagle's algorithm may delay small packets
+                stream.flush().map_err(SendError::TcpError)?;
+                Ok(buf.len())
             }
         }
     }
@@ -256,13 +312,34 @@ impl CmsisDapDevice {
                     }
                 }
             }
+
+            CmsisDapDevice::V3 {
+                stream,
+                max_packet_size,
+                ..
+            } => {
+                use std::io::Read;
+                let mut stream = stream.lock().unwrap();
+                // Set a very short timeout for draining
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(10)));
+                let mut discard = vec![0u8; *max_packet_size];
+                loop {
+                    match stream.read(&mut discard) {
+                        Ok(n) if n != 0 => continue,
+                        _ => break,
+                    }
+                }
+                // Restore TCP timeout (10 seconds for network latency)
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            }
         }
     }
 
     /// Set the packet size to use for this device.
     ///
     /// Sets either the HID report size for V1 devices,
-    /// or the maximum bulk transfer size for V2 devices.
+    /// or the maximum bulk transfer size for V2 devices,
+    /// or the maximum packet size for V3 TCP devices.
     pub(super) fn set_packet_size(&mut self, packet_size: usize) {
         tracing::debug!("Configuring probe to use packet size {}", packet_size);
         match self {
@@ -271,6 +348,11 @@ impl CmsisDapDevice {
                 *report_size = packet_size;
             }
             CmsisDapDevice::V2 {
+                max_packet_size, ..
+            } => {
+                *max_packet_size = packet_size;
+            }
+            CmsisDapDevice::V3 {
                 max_packet_size, ..
             } => {
                 *max_packet_size = packet_size;
@@ -293,6 +375,13 @@ impl CmsisDapDevice {
                 Ok(size) => {
                     tracing::debug!("Success: packet size is {}", size);
                     self.set_packet_size(size as usize);
+                    // For TCP, give the probe time to finish processing
+                    // Since the probe only processes one command at a time and discards
+                    // buffered commands, we just need to wait for it to be ready
+                    if matches!(self, CmsisDapDevice::V3 { .. }) {
+                        tracing::debug!("Waiting for probe to be ready for next command");
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                     return Ok(size as usize);
                 }
 
@@ -300,7 +389,14 @@ impl CmsisDapDevice {
                 Err(CmsisDapError::Send {
                     source: SendError::Timeout,
                     ..
-                }) => (),
+                }) => {
+                    // For TCP connections, add a longer delay between retries
+                    // to give the probe time to respond before retrying
+                    if matches!(self, CmsisDapDevice::V3 { .. }) {
+                        tracing::debug!("Packet size query timed out, waiting before retry");
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+                }
 
                 // Raise other errors.
                 Err(e) => return Err(e),
@@ -317,6 +413,7 @@ impl CmsisDapDevice {
             #[cfg(feature = "cmsisdap_v1")]
             CmsisDapDevice::V1 { .. } => false,
             CmsisDapDevice::V2 { swo_ep, .. } => swo_ep.is_some(),
+            CmsisDapDevice::V3 { .. } => false,
         }
     }
 
@@ -346,6 +443,7 @@ impl CmsisDapDevice {
                 }
                 None => Err(CmsisDapError::SwoModeNotAvailable),
             },
+            CmsisDapDevice::V3 { .. } => Err(CmsisDapError::SwoModeNotAvailable),
         }
     }
 }
@@ -443,6 +541,9 @@ fn send_command_inner<Req: Request>(
         #[cfg(feature = "cmsisdap_v1")]
         CmsisDapDevice::V1 { report_size, .. } => *report_size + 1,
         CmsisDapDevice::V2 {
+            max_packet_size, ..
+        } => *max_packet_size + 1,
+        CmsisDapDevice::V3 {
             max_packet_size, ..
         } => *max_packet_size + 1,
     };
