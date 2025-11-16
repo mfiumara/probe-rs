@@ -68,6 +68,9 @@ pub enum SendError {
     /// Error in the USB access.
     UsbError(std::io::Error),
 
+    /// Error in the TCP access.
+    TcpError(std::io::Error),
+
     /// Not enough data in response from probe.
     NotEnoughData,
 
@@ -259,12 +262,16 @@ impl CmsisDapDevice {
             }
             CmsisDapDevice::V3 { stream, .. } => {
                 use std::io::Write;
-                let mut stream = stream.lock().unwrap();
-                // TODO: Handle this properly and don't unwrap!!!
-                stream.write_all(&buf[1..]).unwrap();
+                let mut stream = stream.lock().map_err(|e| {
+                    SendError::TcpError(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to acquire stream lock: {}", e),
+                    ))
+                })?;
+                stream.write_all(&buf[1..]).map_err(SendError::TcpError)?;
                 // Force flush to ensure data is sent immediately over TCP
                 // Without this, Nagle's algorithm may delay small packets
-                stream.flush().unwrap();
+                stream.flush().map_err(SendError::TcpError)?;
                 Ok(buf.len())
             }
         }
